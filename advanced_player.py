@@ -1,17 +1,90 @@
 import sys
 import os
 import numpy as np
-import pygame
+import threading
+import time
+import pyaudio
+import wave
 import librosa
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QFileDialog, QSlider, QLabel, 
                              QFrame, QSplitter, QProgressBar)
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap
-import matplotlib.pyplot as plt
-import matplotlib.backends.backend_qt5agg as plt_backend
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import queue
+
+class AudioStream:
+    """Class to handle individual audio stream playback"""
+    
+    def __init__(self, audio_data, sample_rate, volume=1.0):
+        self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.volume = volume
+        self.playing = False
+        self.paused = False
+        self.current_position = 0
+        self.audio_queue = queue.Queue()
+        self.p = pyaudio.PyAudio()
+        
+    def start_playback(self):
+        self.playing = True
+        self.paused = False
+        self.current_position = 0
+        
+        def callback(in_data, frame_count, time_info, status):
+            if not self.playing or self.paused:
+                return (b'\x00' * frame_count * 4, pyaudio.paComplete)
+            
+            if self.current_position >= len(self.audio_data):
+                self.playing = False
+                return (b'\x00' * frame_count * 4, pyaudio.paComplete)
+            
+            # Get audio data for this frame
+            end_pos = min(self.current_position + frame_count, len(self.audio_data))
+            frame_data = self.audio_data[self.current_position:end_pos]
+            
+            # Apply volume
+            frame_data = frame_data * self.volume
+            
+            # Convert to bytes
+            if len(frame_data) < frame_count:
+                # Pad with silence if needed
+                frame_data = np.pad(frame_data, (0, frame_count - len(frame_data)))
+            
+            self.current_position += frame_count
+            
+            return (frame_data.astype(np.float32).tobytes(), pyaudio.paContinue)
+        
+        self.stream = self.p.open(
+            format=pyaudio.paFloat32,
+            channels=1,
+            rate=self.sample_rate,
+            output=True,
+            stream_callback=callback,
+            frames_per_buffer=1024
+        )
+        self.stream.start_stream()
+    
+    def pause(self):
+        self.paused = True
+    
+    def resume(self):
+        self.paused = False
+    
+    def stop(self):
+        self.playing = False
+        if hasattr(self, 'stream'):
+            self.stream.stop_stream()
+            self.stream.close()
+    
+    def set_volume(self, volume):
+        self.volume = volume
+    
+    def get_position(self):
+        return self.current_position / self.sample_rate
+    
+    def get_duration(self):
+        return len(self.audio_data) / self.sample_rate
 
 class AudioProcessor(QThread):
     """Thread for processing audio files and generating waveforms"""
@@ -96,14 +169,11 @@ class WaveformWidget(QWidget):
             painter.setPen(QPen(position_color, 2))
             painter.drawLine(position_x, 0, position_x, height)
 
-class MP3Player(QMainWindow):
+class AdvancedMP3Player(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dual MP3 Player with Waveform")
+        self.setWindowTitle("Advanced Dual MP3 Player with Waveform")
         self.setGeometry(100, 100, 1200, 800)
-        
-        # Initialize pygame mixer
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
         
         # Audio data storage
         self.track1_data = None
@@ -112,6 +182,10 @@ class MP3Player(QMainWindow):
         self.track2_data = None
         self.track2_sr = None
         self.track2_path = None
+        
+        # Audio streams
+        self.track1_stream = None
+        self.track2_stream = None
         
         # Audio processing threads
         self.track1_processor = None
@@ -124,12 +198,6 @@ class MP3Player(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_position)
         self.timer.start(100)  # Update every 100ms
-        
-        # Track states
-        self.track1_playing = False
-        self.track2_playing = False
-        self.track1_paused = False
-        self.track2_paused = False
         
     def setup_ui(self):
         central_widget = QWidget()
@@ -358,38 +426,35 @@ class MP3Player(QMainWindow):
             self.track2_stop_btn.setEnabled(True)
     
     def play_track(self, track_num):
-        if track_num == 1 and self.track1_path:
-            if self.track1_paused:
-                pygame.mixer.music.unpause()
-                self.track1_paused = False
-            else:
-                pygame.mixer.music.load(self.track1_path)
-                pygame.mixer.music.play()
-            self.track1_playing = True
-        elif track_num == 2 and self.track2_path:
-            # For track 2, we'll use a different approach since pygame.mixer only supports one track
-            # We'll simulate it by creating a separate audio stream
-            self.track2_playing = True
+        if track_num == 1 and self.track1_data is not None:
+            if self.track1_stream is None:
+                volume = self.track1_volume_slider.value() / 100.0
+                self.track1_stream = AudioStream(self.track1_data, self.track1_sr, volume)
+            self.track1_stream.start_playback()
+        elif track_num == 2 and self.track2_data is not None:
+            if self.track2_stream is None:
+                volume = self.track2_volume_slider.value() / 100.0
+                self.track2_stream = AudioStream(self.track2_data, self.track2_sr, volume)
+            self.track2_stream.start_playback()
     
     def pause_track(self, track_num):
-        if track_num == 1 and self.track1_playing:
-            pygame.mixer.music.pause()
-            self.track1_paused = True
-        elif track_num == 2 and self.track2_playing:
-            self.track2_playing = False
+        if track_num == 1 and self.track1_stream:
+            self.track1_stream.pause()
+        elif track_num == 2 and self.track2_stream:
+            self.track2_stream.pause()
     
     def stop_track(self, track_num):
-        if track_num == 1:
-            pygame.mixer.music.stop()
-            self.track1_playing = False
-            self.track1_paused = False
-        elif track_num == 2:
-            self.track2_playing = False
+        if track_num == 1 and self.track1_stream:
+            self.track1_stream.stop()
+            self.track1_stream = None
+        elif track_num == 2 and self.track2_stream:
+            self.track2_stream.stop()
+            self.track2_stream = None
     
     def play_all(self):
-        if self.track1_path:
+        if self.track1_data is not None:
             self.play_track(1)
-        if self.track2_path:
+        if self.track2_data is not None:
             self.play_track(2)
     
     def stop_all(self):
@@ -398,34 +463,45 @@ class MP3Player(QMainWindow):
     
     def set_volume(self, track_num):
         volume = getattr(self, f'track{track_num}_volume_slider').value() / 100.0
-        if track_num == 1:
-            pygame.mixer.music.set_volume(volume)
+        if track_num == 1 and self.track1_stream:
+            self.track1_stream.set_volume(volume)
+        elif track_num == 2 and self.track2_stream:
+            self.track2_stream.set_volume(volume)
     
     def update_position(self):
-        if self.track1_playing and not self.track1_paused:
-            try:
-                current_time = pygame.mixer.music.get_pos() / 1000.0
-                if self.track1_data is not None and self.track1_sr is not None:
-                    duration = len(self.track1_data) / self.track1_sr
-                    
-                    # Update waveform position
-                    self.track1_waveform.set_position(current_time)
-                    
-                    # Update progress bar
-                    progress = int((current_time / duration) * 100) if duration > 0 else 0
-                    self.track1_progress_bar.setValue(progress)
-                    
-                    # Update time label
-                    current_str = self.format_time(current_time)
-                    duration_str = self.format_time(duration)
-                    self.track1_time_label.setText(f"{current_str} / {duration_str}")
-            except:
-                pass
+        # Update track 1 position
+        if self.track1_stream and self.track1_stream.playing:
+            current_time = self.track1_stream.get_position()
+            duration = self.track1_stream.get_duration()
+            
+            # Update waveform position
+            self.track1_waveform.set_position(current_time)
+            
+            # Update progress bar
+            progress = int((current_time / duration) * 100) if duration > 0 else 0
+            self.track1_progress_bar.setValue(progress)
+            
+            # Update time label
+            current_str = self.format_time(current_time)
+            duration_str = self.format_time(duration)
+            self.track1_time_label.setText(f"{current_str} / {duration_str}")
         
-        # For track 2, we'll simulate progress
-        if self.track2_playing and self.track2_data is not None and self.track2_sr is not None:
-            # This is a simplified simulation - in a real implementation you'd track actual playback
-            pass
+        # Update track 2 position
+        if self.track2_stream and self.track2_stream.playing:
+            current_time = self.track2_stream.get_position()
+            duration = self.track2_stream.get_duration()
+            
+            # Update waveform position
+            self.track2_waveform.set_position(current_time)
+            
+            # Update progress bar
+            progress = int((current_time / duration) * 100) if duration > 0 else 0
+            self.track2_progress_bar.setValue(progress)
+            
+            # Update time label
+            current_str = self.format_time(current_time)
+            duration_str = self.format_time(duration)
+            self.track2_time_label.setText(f"{current_str} / {duration_str}")
     
     def format_time(self, seconds):
         minutes = int(seconds // 60)
@@ -433,11 +509,11 @@ class MP3Player(QMainWindow):
         return f"{minutes:02d}:{seconds:02d}"
     
     def closeEvent(self, event):
-        pygame.mixer.quit()
+        self.stop_all()
         event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    player = MP3Player()
+    player = AdvancedMP3Player()
     player.show()
     sys.exit(app.exec_())
